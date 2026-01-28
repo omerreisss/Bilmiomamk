@@ -9,6 +9,12 @@ from datetime import datetime
 import re
 from typing import Dict, List
 from urllib.parse import quote
+import subprocess
+
+try:
+    subprocess.run(["playwright", "install"], check=True)
+except:
+    pass
 
 # ========== KONFİGÜRASYON ==========
 TOKEN = "8516981652:AAGl7kQFtSNfjRDoNbMbu4B6mBu0tGct5hk"
